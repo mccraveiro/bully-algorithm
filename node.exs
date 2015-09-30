@@ -7,63 +7,63 @@ defmodule Bully do
   or `Bully.connect <id>` to start and connect a node
   """
 
+  defp init do
+    # Start leader as itself
+    init_leader Node.self
+    # Get nodes status messages
+    :global_group.monitor_nodes(true)
+    :global.register_name Node.self, self
+  end
+
   @doc """
   Call this to start a node by itself
   """
   def start do
-    # Start leader as itself
-    init_leader Node.self
-    start_monitoring
+    init
+    loop
   end
 
   @doc """
   Call this to start a node and connect to an existing node
   """
   def connect(id, hostname \\ host) do
-    remote = String.to_atom(to_string(id) <> "@" <> hostname)
+    init
     # Connect to other nodes
-    Node.connect remote
-    # Get current leader
-    init_leader rpc(remote, :leader)
-    start_election
-    start_monitoring
-  end
-
-  @doc """
-  Get current leader
-  """
-  def current_leader do
-    Agent.get(:leader, &(&1))
-  end
-
-  @doc """
-  Update current leader
-  """
-  def update_leader(new_leader) do
-    Agent.update(:leader, fn(_) -> new_leader end)
-  end
-
-  defp host do
-    :inet.gethostname()
-    |> elem(1)
-    |> to_string
+    Node.connect(String.to_atom(to_string(id) <> "@" <> hostname))
+    :global.sync
+    loop
   end
 
   defp init_leader(leader) do
     Agent.start_link(fn -> leader end, name: :leader)
   end
 
-  defp start_monitoring do
-    # Get nodes status messages
-    :global_group.monitor_nodes(true)
-    loop
+  defp current_leader do
+    Agent.get(:leader, &(&1))
+  end
+
+  defp update_leader(new_leader) do
+    Agent.update(:leader, fn(_) -> new_leader end)
+  end
+
+  defp host do
+    # Get localhost name
+    :inet.gethostname()
+    |> elem(1)
+    |> to_string
   end
 
   defp start_election do
     IO.puts "ELECTION!"
 
-    if higher_nodes? do
+    if any_higher_nodes? do
       IO.puts "Lost election :("
+      # wait 5s if no coordinator, start election again
+      receive do
+        {:coordinator, node} -> update_leader(node)
+      after
+        5_000 -> start_election
+      end
     else
       IO.puts "Won election \\o/"
       update_leader Node.self
@@ -71,35 +71,69 @@ defmodule Bully do
     end
   end
 
-  defp higher_nodes? do
+  defp any_higher_nodes? do
     Node.list
     # Get all nodes higher than itself
     |> Enum.filter(fn(node) -> node > Node.self end)
     # Test if any is alive
-    |> Enum.any?(fn(node) -> Node.ping(node) == :pong end)
+    |> Enum.any?(fn(node) ->
+      :global.send node, {:election, Node.self}
+
+      receive do
+        {:alive, remote} when remote == node -> true
+      after
+        5_000 -> false
+      end
+    end)
   end
 
   defp broadcast_victory do
-    Node.list
-    |> Enum.each(fn(node) -> rpc(node, :update_leader, [Node.self]) end)
+    # Send a coordinator message for each node
+    Enum.each(Node.list, fn(node) ->
+      :global.send node, {:coordinator, Node.self}
+    end)
+  end
+
+  defp on(:nodeup, node) do
+    IO.puts "Node connected: " <> to_string(node)
+    :global.sync
+
+    if node > current_leader do
+      start_election
+    end
+  end
+
+  defp on(:nodedown, node) do
+    IO.puts "Node disconnected: " <> to_string(node)
+
+    if node == current_leader do
+      start_election
+    end
+  end
+
+  defp on(:election, node) do
+    :global.send node, {:alive, Node.self}
+
+    if Node.self > node do
+      start_election
+    end
+  end
+
+  defp on(:coordinator, node) do
+    if Node.self > node do
+      start_election
+    else
+      update_leader node
+    end
   end
 
   defp loop do
     receive do
-      {:nodeup, node} ->
-        IO.puts "Node connected: " <> to_string(node)
-        start_election
-      {:nodedown, node} ->
-        IO.puts "Node disconnected: " <> to_string(node)
-        if node == current_leader, do: start_election
+      {event, node} -> on(event, node)
     after
-      1000 ->
-        IO.puts "Current leader: " <> to_string(current_leader)
+      1000 -> IO.puts("Current leader: " <> to_string(current_leader))
     end
-    loop
-  end
 
-  defp rpc(remote, method, args \\ []) do
-    :rpc.call(remote, __MODULE__, method, args, 5000)
+    loop
   end
 end
